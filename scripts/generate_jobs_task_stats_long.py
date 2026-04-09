@@ -1,6 +1,8 @@
 import argparse
+import concurrent.futures
 import csv
 import json
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean
@@ -55,6 +57,64 @@ def format_float(value: float | None, digits: int) -> str:
     return f"{value:.{digits}f}"
 
 
+def iter_result_paths(jobs_dir: Path) -> list[Path]:
+    verified_paths: list[Path] = []
+
+    with os.scandir(jobs_dir) as group_entries:
+        for group_entry in group_entries:
+            if not group_entry.is_dir(follow_symlinks=False):
+                continue
+
+            group_path = Path(group_entry.path)
+            group_result_path = group_path / "result.json"
+            if group_result_path.is_file():
+                verified_paths.append(group_result_path)
+
+            with os.scandir(group_entry.path) as result_entries:
+                for result_entry in result_entries:
+                    if result_entry.is_dir(follow_symlinks=False):
+                        verified_paths.append(Path(result_entry.path) / "result.json")
+
+    return verified_paths
+
+
+def load_trial_group_entry(
+    result_path: Path,
+) -> tuple[tuple[str, str, str, str], dict[str, object]] | None:
+    try:
+        result_data = json.loads(result_path.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        print(f"Skipping unreadable JSON: {result_path} ({exc})")
+        return None
+
+    config = result_data.get("config") or {}
+    agent_config = config.get("agent") or {}
+    task_name = result_data.get("task_name")
+    agent_name = agent_config.get("name")
+    model_name = agent_config.get("model_name")
+    if not (task_name and agent_name and model_name):
+        return None
+
+    dataset = infer_dataset(result_data, result_path)
+    agent_result = result_data.get("agent_result") or {}
+    verifier_result = result_data.get("verifier_result") or {}
+    rewards = verifier_result.get("rewards") or {}
+
+    key = (dataset, task_name, agent_name, model_name)
+    return (
+        key,
+        {
+            "reward": rewards.get("reward"),
+            "input_tokens": agent_result.get("n_input_tokens"),
+            "output_tokens": agent_result.get("n_output_tokens"),
+            "cache_tokens": agent_result.get("n_cache_tokens"),
+            "errortype": infer_error_type(result_data.get("exception_info")),
+        },
+    )
+
+
 def load_trial_groups(
     jobs_dir: Path,
 ) -> dict[tuple[str, str, str, str], list[dict[str, object]]]:
@@ -62,36 +122,16 @@ def load_trial_groups(
         defaultdict(list)
     )
 
-    for result_path in sorted(jobs_dir.glob("*/*/result.json")):
-        try:
-            result_data = json.loads(result_path.read_text())
-        except Exception as exc:
-            print(f"Skipping unreadable JSON: {result_path} ({exc})")
-            continue
-
-        config = result_data.get("config") or {}
-        agent_config = config.get("agent") or {}
-        task_name = result_data.get("task_name")
-        agent_name = agent_config.get("name")
-        model_name = agent_config.get("model_name")
-        if not (task_name and agent_name and model_name):
-            continue
-
-        dataset = infer_dataset(result_data, result_path)
-        agent_result = result_data.get("agent_result") or {}
-        verifier_result = result_data.get("verifier_result") or {}
-        rewards = verifier_result.get("rewards") or {}
-
-        key = (dataset, task_name, agent_name, model_name)
-        trial_groups[key].append(
-            {
-                "reward": rewards.get("reward"),
-                "input_tokens": agent_result.get("n_input_tokens"),
-                "output_tokens": agent_result.get("n_output_tokens"),
-                "cache_tokens": agent_result.get("n_cache_tokens"),
-                "errortype": infer_error_type(result_data.get("exception_info")),
-            }
-        )
+    result_paths = iter_result_paths(jobs_dir)
+    max_workers = min(32, (os.cpu_count() or 1) * 2)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for trial_entry in executor.map(
+            load_trial_group_entry, result_paths, chunksize=32
+        ):
+            if trial_entry is None:
+                continue
+            key, entry = trial_entry
+            trial_groups[key].append(entry)
 
     return trial_groups
 
