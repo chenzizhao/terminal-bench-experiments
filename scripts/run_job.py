@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+from contextlib import ExitStack, contextmanager
+import inspect
 import json
 import os
 import shutil
@@ -13,9 +15,10 @@ from urllib.parse import urlparse
 
 import harbor
 import yaml
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from harbor.job import Job
 from harbor.models.job.config import JobConfig
+from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
@@ -33,7 +36,290 @@ from db.schema_public_latest import (
     TrialModelInsert,
 )
 
-load_dotenv()
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ENV_FILE = REPO_ROOT / ".env"
+ENV_FILE_VALUES = dotenv_values(ENV_FILE) if ENV_FILE.exists() else {}
+ANTHROPIC_PROXY_ENV_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN")
+RESUME_UNORDERED_LIST_PATHS = {
+    ("retry", "include_exceptions"),
+    ("retry", "exclude_exceptions"),
+}
+
+load_dotenv(ENV_FILE if ENV_FILE.exists() else None)
+
+
+def _job_uses_codex(config: JobConfig) -> bool:
+    return any((agent.name or "").lower() == "codex" for agent in config.agents)
+
+
+def _job_uses_official_anthropic(config: JobConfig) -> bool:
+    return any((agent.model_name or "").startswith("anthropic/") for agent in config.agents)
+
+
+def _job_explicitly_sets_env(config: JobConfig, key: str) -> bool:
+    if key in config.environment.env:
+        return True
+    return any(key in agent.env for agent in config.agents)
+
+
+def _sanitize_ambient_anthropic_proxy_env(config: JobConfig) -> None:
+    """
+    Prefer repo-declared Anthropic credentials over unrelated shell-level proxy vars.
+
+    These jobs target official ``anthropic/*`` models. If the repo's ``.env`` does not
+    declare a proxy URL/token, ambient shell exports like ``ANTHROPIC_BASE_URL`` can
+    silently reroute requests to a different upstream and cause 401s.
+    """
+    if not _job_uses_official_anthropic(config):
+        return
+    if "ANTHROPIC_API_KEY" not in os.environ:
+        return
+
+    cleared_vars: list[str] = []
+    for env_var in ANTHROPIC_PROXY_ENV_VARS:
+        if ENV_FILE_VALUES.get(env_var) is not None:
+            continue
+        if _job_explicitly_sets_env(config, env_var):
+            continue
+        if os.environ.pop(env_var, None) is not None:
+            cleared_vars.append(env_var)
+
+    if cleared_vars:
+        print(
+            "Cleared ambient Anthropic proxy settings for official anthropic/* "
+            f"models: {', '.join(cleared_vars)}"
+        )
+
+
+def _sanitize_ambient_codex_auth(config: JobConfig) -> None:
+    """
+    Prefer repo-declared OPENAI_API_KEY over ambient ~/.codex/auth.json for Codex jobs.
+
+    Harbor's Codex agent defaults to injecting ~/.codex/auth.json when it exists,
+    which silently overrides the repository's OPENAI_API_KEY. Users can still opt
+    into auth.json explicitly with CODEX_AUTH_JSON_PATH or manage precedence with
+    an explicit CODEX_FORCE_API_KEY setting.
+    """
+    if not _job_uses_codex(config):
+        return
+    if ENV_FILE_VALUES.get("OPENAI_API_KEY") is None:
+        return
+    if _job_explicitly_sets_env(config, "CODEX_FORCE_API_KEY"):
+        return
+    if _job_explicitly_sets_env(config, "CODEX_AUTH_JSON_PATH"):
+        return
+    if os.environ.get("CODEX_FORCE_API_KEY") is not None:
+        return
+    if os.environ.get("CODEX_AUTH_JSON_PATH"):
+        return
+
+    default_auth_json = Path.home() / ".codex" / "auth.json"
+    if not default_auth_json.is_file():
+        return
+
+    os.environ["CODEX_FORCE_API_KEY"] = "1"
+    print(
+        "Set CODEX_FORCE_API_KEY=1 so Codex jobs use OPENAI_API_KEY from the repo "
+        "environment instead of ~/.codex/auth.json"
+    )
+
+
+def _configs_match_for_resume(
+    existing_config: JobConfig, requested_config: JobConfig
+) -> bool:
+    """
+    Compare configs using a normalized JSON form so resume tolerates benign drift.
+
+    Harbor serializes sensitive env vars in ``config.json`` with masking. Direct model
+    equality compares the in-memory raw values and incorrectly rejects resume attempts
+    when the requested config still contains the original secret. Some config fields
+    are set-like but serialized as JSON arrays, so order-only differences should not
+    block resume either.
+    """
+    return _resume_values_match(
+        existing_config.model_dump(mode="json"),
+        requested_config.model_dump(mode="json"),
+        ignore_paths={("n_concurrent_trials",)},
+    )
+
+
+def _models_match_for_resume(existing_model: object, requested_model: object) -> bool:
+    if not hasattr(existing_model, "model_dump") or not hasattr(
+        requested_model, "model_dump"
+    ):
+        return existing_model == requested_model
+
+    return _resume_values_match(
+        existing_model.model_dump(mode="json"),
+        requested_model.model_dump(mode="json"),
+    )
+
+
+def _resume_values_match(
+    existing_value: object,
+    requested_value: object,
+    path: tuple[str, ...] = (),
+    *,
+    ignore_paths: set[tuple[str, ...]] | None = None,
+) -> bool:
+    if ignore_paths and path in ignore_paths:
+        return True
+
+    if existing_value == requested_value:
+        return True
+
+    if _masked_string_matches(existing_value, requested_value):
+        return True
+
+    if isinstance(existing_value, dict) and isinstance(requested_value, dict):
+        if set(existing_value) != set(requested_value):
+            return False
+
+        return all(
+            _resume_values_match(
+                existing_value[key],
+                requested_value[key],
+                path + (str(key),),
+                ignore_paths=ignore_paths,
+            )
+            for key in existing_value
+        )
+
+    if isinstance(existing_value, list) and isinstance(requested_value, list):
+        if len(existing_value) != len(requested_value):
+            return False
+
+        if path in RESUME_UNORDERED_LIST_PATHS:
+            return sorted(existing_value) == sorted(requested_value)
+
+        return all(
+            _resume_values_match(
+                existing_item,
+                requested_item,
+                path + (str(index),),
+                ignore_paths=ignore_paths,
+            )
+            for index, (existing_item, requested_item) in enumerate(
+                zip(existing_value, requested_value, strict=True)
+            )
+        )
+
+    return False
+
+
+def _masked_string_matches(existing_value: object, requested_value: object) -> bool:
+    if not isinstance(existing_value, str) or not isinstance(requested_value, str):
+        return False
+
+    return _masked_string_matches_one_way(
+        masked_value=existing_value, actual_value=requested_value
+    ) or _masked_string_matches_one_way(
+        masked_value=requested_value, actual_value=existing_value
+    )
+
+
+def _masked_string_matches_one_way(masked_value: str, actual_value: str) -> bool:
+    if "****" not in masked_value:
+        return False
+
+    prefix, _, suffix = masked_value.partition("****")
+    return (
+        actual_value.startswith(prefix)
+        and actual_value.endswith(suffix)
+        and len(actual_value) >= len(prefix) + len(suffix)
+    )
+
+
+@contextmanager
+def _patched_model_equality_for_resume(model_type: type[object]):
+    original_eq = model_type.__eq__
+
+    def _model_eq_for_resume(self: object, other: object):
+        if not isinstance(other, model_type):
+            return NotImplemented
+        return _models_match_for_resume(self, other)
+
+    model_type.__eq__ = _model_eq_for_resume  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        model_type.__eq__ = original_eq  # type: ignore[method-assign]
+
+
+@contextmanager
+def _patched_trial_config_equality_for_resume():
+    original_eq = TrialConfig.__eq__
+
+    def _trial_config_eq_for_resume(self: object, other: object):
+        if not isinstance(self, TrialConfig) or not isinstance(other, TrialConfig):
+            return NotImplemented
+
+        return (
+            _models_match_for_resume(self.task, other.task)
+            and self.trials_dir == other.trials_dir
+            and self.timeout_multiplier == other.timeout_multiplier
+            and self.agent_timeout_multiplier == other.agent_timeout_multiplier
+            and self.verifier_timeout_multiplier == other.verifier_timeout_multiplier
+            and self.agent_setup_timeout_multiplier
+            == other.agent_setup_timeout_multiplier
+            and self.environment_build_timeout_multiplier
+            == other.environment_build_timeout_multiplier
+            and _models_match_for_resume(self.agent, other.agent)
+            and _models_match_for_resume(self.environment, other.environment)
+            and _models_match_for_resume(self.verifier, other.verifier)
+            and _resume_values_match(self.artifacts, other.artifacts)
+        )
+
+    TrialConfig.__eq__ = _trial_config_eq_for_resume  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        TrialConfig.__eq__ = original_eq  # type: ignore[method-assign]
+
+
+@contextmanager
+def _patched_resume_equalities():
+    with ExitStack() as stack:
+        stack.enter_context(_patched_model_equality_for_resume(JobConfig))
+        stack.enter_context(_patched_trial_config_equality_for_resume())
+        yield
+
+
+async def create_job_compat(config: JobConfig) -> Job:
+    """
+    Create a Harbor job across old and new Harbor versions.
+
+    Harbor >= 2026-03-27 requires ``await Job.create(config)`` because job
+    initialization now performs async dataset and task resolution. Older Harbor
+    versions still support direct instantiation.
+    """
+    create = getattr(Job, "create", None)
+    with _patched_resume_equalities():
+        if callable(create):
+            maybe_job = create(config)
+            if inspect.isawaitable(maybe_job):
+                return await maybe_job
+            return maybe_job
+
+        return Job(config=config)
+
+
+async def create_job_compat(config: JobConfig) -> Job:
+    """
+    Create a Harbor job across old and new Harbor versions.
+
+    Harbor >= 2026-03-27 requires ``await Job.create(config)`` because job
+    initialization now performs async dataset and task resolution. Older Harbor
+    versions still support direct instantiation.
+    """
+    create = getattr(Job, "create", None)
+    if callable(create):
+        maybe_job = create(config)
+        if inspect.isawaitable(maybe_job):
+            return await maybe_job
+        return maybe_job
+
+    return Job(config=config)
 
 
 async def upload_trial_to_storage(result: TrialResult) -> str | None:
@@ -392,12 +678,10 @@ async def main():
         action="append",
         help="Filter error types",
     )
-
     parser.add_argument(
-        "-n",
-        "--n_concurrent_trials",
+        "-n", "--override-n-concurrent-trials",
         type=int,
-        help="Number of concurrent trials to run (overrides config file)",
+        help="Override n_concurrent_trials for this run, including resume runs.",
     )
 
     args = parser.parse_args()
@@ -409,11 +693,13 @@ async def main():
     else:
         config_dict = yaml.safe_load(config_text)
 
-    if args.n_concurrent_trials is not None:
-        config_dict["orchestrator"]["n_concurrent_trials"] = args.n_concurrent_trials
-        print(f"Overriding n_concurrent_trials to {args.n_concurrent_trials}")
-
     config = JobConfig.model_validate(config_dict)
+    if args.override_n_concurrent_trials is not None:
+        if args.override_n_concurrent_trials <= 0:
+            raise ValueError("--override-n-concurrent-trials must be a positive integer")
+        config.n_concurrent_trials = args.override_n_concurrent_trials
+    _sanitize_ambient_anthropic_proxy_env(config)
+    _sanitize_ambient_codex_auth(config)
 
     job_path = config.jobs_dir / config.job_name
 
@@ -422,7 +708,7 @@ async def main():
             (job_path / "config.json").read_text()
         )
 
-        if existing_config != config:
+        if not _configs_match_for_resume(existing_config, config):
             raise ValueError(
                 f"Job directory {job_path} already exists and cannot be "
                 "resumed with a different config."
@@ -460,7 +746,7 @@ async def main():
                 )
                 shutil.rmtree(trial_dir)
 
-    job = Job(config=config)
+    job = await create_job_compat(config)
 
     job_insert = JobInsert(
         id=job._id,

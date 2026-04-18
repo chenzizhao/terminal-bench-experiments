@@ -512,11 +512,11 @@ def _require_task_list(payload: dict[str, Any], key: str) -> list[dict[str, Any]
     return tasks
 
 
-def _task_identity(task: dict[str, Any]) -> dict[str, str]:
+def _task_identity(task: dict[str, Any]) -> dict[str, str | None]:
     return {
         "name": _require_str(task, "name"),
-        "git_url": _require_str(task, "git_url"),
-        "git_commit_id": _require_str(task, "git_commit_id"),
+        "git_url": task.get("git_url") or None,
+        "git_commit_id": task.get("git_commit_id") or None,
         "path": _require_str(task, "path"),
     }
 

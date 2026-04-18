@@ -1,0 +1,11 @@
+terminus-2__claude-haiku-4.5:
+  agent:
+    name: terminus-2
+    model_name: anthropic/claude-haiku-4-5-20251001
+  metadata:
+    display_name: Terminus 2 / Claude Haiku 4.5
+    runner: terminus-2
+    family: terminus-2
+    model_name: anthropic/claude-haiku-4-5-20251001
+    generated_by: manual
+    provider: anthropic

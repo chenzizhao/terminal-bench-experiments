@@ -8,8 +8,9 @@ from typing import Annotated
 import harbor
 import yaml
 from dotenv import load_dotenv
+from harbor.cli.utils import run_async
 from harbor.models.dataset_item import DownloadedDatasetItem
-from harbor.models.job.config import JobConfig, LocalDatasetConfig
+from harbor.models.job.config import DatasetConfig, JobConfig
 from harbor.models.registry import DatasetSpec, RegistryTaskId
 from harbor.models.task.task import Task
 from harbor.models.trial.result import TrialResult
@@ -231,10 +232,11 @@ def upload_dataset(
                     config_file.parent / config_dataset_path
                 ).resolve()
 
-            dataset_config = LocalDatasetConfig(
+            dataset_config = DatasetConfig(
                 path=config_dataset_path,
                 task_names=first_dataset.get("task_names"),
                 exclude_task_names=first_dataset.get("exclude_task_names"),
+                n_tasks=first_dataset.get("n_tasks"),
             )
 
             # Override dataset_path if not already provided
@@ -295,11 +297,12 @@ def upload_dataset(
                     main_task, description="[yellow]Downloading dataset items..."
                 )
                 try:
-                    downloaded_dataset_items = registry_client.download_dataset(
-                        name=name,
-                        version=version,
-                        overwrite=True,
-                        output_dir=dataset_path,
+                    downloaded_dataset_items = run_async(
+                        registry_client.download_dataset(
+                            name=f"{name}@{version}",
+                            overwrite=True,
+                            output_dir=dataset_path,
+                        )
                     )
                 except Exception as e:
                     progress.update(main_task, description="[red]✗ Download failed")
@@ -311,13 +314,11 @@ def upload_dataset(
                 )
                 # Use get_task_configs() if we have a dataset config from the config file
                 if dataset_config is not None:
-                    task_configs = dataset_config.get_task_configs()
+                    task_configs = run_async(dataset_config.get_task_configs())
                     downloaded_dataset_items = [
                         DownloadedDatasetItem(
-                            id=RegistryTaskId(
-                                name=task_config.path.name, path=task_config.path
-                            ),
-                            downloaded_path=task_config.path,
+                            id=task_config.get_task_id(),
+                            downloaded_path=task_config.get_local_path(),
                         )
                         for task_config in task_configs
                     ]
@@ -383,10 +384,14 @@ def upload_dataset(
 
             for downloaded_dataset_item in downloaded_dataset_items:
                 try:
+                    task_id = downloaded_dataset_item.id
                     task_path = (
-                        downloaded_dataset_item.id.path.expanduser().resolve()
-                        if downloaded_dataset_item.id.git_url is None
-                        else downloaded_dataset_item.id.path
+                        task_id.path.expanduser().resolve()
+                        if hasattr(task_id, "path")
+                        and getattr(task_id, "git_url", None) is None
+                        else task_id.path
+                        if hasattr(task_id, "path")
+                        else downloaded_dataset_item.downloaded_path.expanduser().resolve()
                     )
                     task = Task(downloaded_dataset_item.downloaded_path)
                     task_inserts.append(
@@ -400,8 +405,8 @@ def upload_dataset(
                                 task.config.verifier.timeout_sec
                             ),
                             path=str(task_path),
-                            git_url=downloaded_dataset_item.id.git_url,
-                            git_commit_id=downloaded_dataset_item.id.git_commit_id,
+                            git_url=getattr(task_id, "git_url", None),
+                            git_commit_id=getattr(task_id, "git_commit_id", None),
                             metadata=task.config.metadata,
                         ).model_dump(mode="json", by_alias=True, exclude_none=True)
                     )
@@ -414,9 +419,10 @@ def upload_dataset(
                         ).model_dump(mode="json", by_alias=True, exclude_none=True)
                     )
                 except Exception as e:
-                    failed_tasks.append((downloaded_dataset_item.id.name, str(e)))
+                    task_name = downloaded_dataset_item.id.get_name()
+                    failed_tasks.append((task_name, str(e)))
                     errors.append(
-                        f"Failed to process task {downloaded_dataset_item.id.name}: {e}"
+                        f"Failed to process task {task_name}: {e}"
                     )
 
                 progress.update(task_processing, advance=1)

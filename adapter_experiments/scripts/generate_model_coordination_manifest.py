@@ -174,6 +174,61 @@ def _catalog(
             metadata={'provider': 'gemini'},
         ),
         AdapterSpec(
+            adapter_id='terminus-2__claude-haiku-4-5-20251001',
+            family='terminus-2',
+            agent_name='terminus-2',
+            model_name='anthropic/claude-haiku-4-5-20251001',
+            display_name='Terminus 2 / Claude Haiku 4.5 (2025-10-01)',
+            metadata={'provider': 'anthropic'},
+        ),
+        AdapterSpec(
+            adapter_id='terminus-2__claude-sonnet-4-6',
+            family='terminus-2',
+            agent_name='terminus-2',
+            model_name='anthropic/claude-sonnet-4-6',
+            display_name='Terminus 2 / Claude Sonnet 4.6',
+            metadata={'provider': 'anthropic'},
+        ),
+        AdapterSpec(
+            adapter_id='terminus-2__claude-opus-4-6',
+            family='terminus-2',
+            agent_name='terminus-2',
+            model_name='anthropic/claude-opus-4-6',
+            display_name='Terminus 2 / Claude Opus 4.6',
+            metadata={'provider': 'anthropic'},
+        ),
+        AdapterSpec(
+            adapter_id='terminus-2__qwen3-max',
+            family='terminus-2',
+            agent_name='terminus-2',
+            model_name='openai/qwen3-max',
+            display_name='Terminus 2 / Qwen3 Max',
+            kwargs={
+                'api_base': '${QWEN_API_BASE}',
+                'llm_kwargs': {
+                    'api_key': '${QWEN_API_KEY}',
+                },
+            },
+            env_templates={
+                'OPENAI_API_KEY': '${QWEN_API_KEY}',
+                'OPENAI_BASE_URL': '${QWEN_API_BASE}',
+            },
+            metadata={'provider': 'openai'},
+        ),
+        AdapterSpec(
+            adapter_id='qwen-coder__qwen3-max',
+            family='qwen-coder',
+            agent_name='qwen-coder',
+            model_name='qwen3-max',
+            display_name='Qwen Coder / Qwen3-Max',
+            kwargs={'version': '0.14.5'},
+            env_templates={
+                'OPENAI_API_KEY': '${QWEN_API_KEY}',
+                'OPENAI_BASE_URL': '${QWEN_API_BASE}',
+            },
+            metadata={'provider': 'qwen'},
+        ),
+        AdapterSpec(
             adapter_id='codex__gpt-5.4',
             family='codex',
             agent_name='codex',
@@ -314,6 +369,33 @@ def _catalog(
             },
             metadata={'provider': 'xiaomi_mimo'},
         ),
+        AdapterSpec(
+            adapter_id='claude-code__claude-haiku-4-5-20251001',
+            family='claude-code',
+            agent_name='claude-code',
+            model_name='anthropic/claude-haiku-4-5-20251001',
+            display_name='Claude Code / Claude Haiku 4.5 (2025-10-01)',
+            kwargs={'version': claude_code_version},
+            metadata={'provider': 'anthropic'},
+        ),
+        AdapterSpec(
+            adapter_id='claude-code__claude-sonnet-4-6',
+            family='claude-code',
+            agent_name='claude-code',
+            model_name='anthropic/claude-sonnet-4-6',
+            display_name='Claude Code / Claude Sonnet 4.6',
+            kwargs={'version': claude_code_version},
+            metadata={'provider': 'anthropic'},
+        ),
+        AdapterSpec(
+            adapter_id='claude-code__claude-opus-4-6',
+            family='claude-code',
+            agent_name='claude-code',
+            model_name='anthropic/claude-opus-4-6',
+            display_name='Claude Code / Claude Opus 4.6',
+            kwargs={'version': claude_code_version},
+            metadata={'provider': 'anthropic'},
+        ),
     ]
 
 
@@ -423,7 +505,7 @@ def _build_manifest(
             'model_name': spec.model_name,
         }
         if spec.kwargs:
-            agent['kwargs'] = dict(spec.kwargs)
+            agent['kwargs'] = _resolve_obj(spec.kwargs, env_values)
         if spec.env_templates:
             agent['env'] = _resolve_obj(spec.env_templates, env_values)
 

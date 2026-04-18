@@ -1,0 +1,13 @@
+claude-code__claude-opus-4.6:
+  agent:
+    name: claude-code
+    model_name: anthropic/claude-opus-4-6
+    kwargs:
+      version: 2.1.81
+  metadata:
+    display_name: Claude Code / Claude Opus 4.6
+    runner: claude-code
+    family: claude-code
+    model_name: anthropic/claude-opus-4-6
+    generated_by: manual
+    provider: anthropic
