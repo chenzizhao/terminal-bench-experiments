@@ -1,0 +1,11 @@
+terminus-2__claude-sonnet-4.6:
+  agent:
+    name: terminus-2
+    model_name: anthropic/claude-sonnet-4-6
+  metadata:
+    display_name: Terminus 2 / Claude Sonnet 4.6
+    runner: terminus-2
+    family: terminus-2
+    model_name: anthropic/claude-sonnet-4-6
+    generated_by: manual
+    provider: anthropic

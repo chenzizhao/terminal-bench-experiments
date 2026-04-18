@@ -43,6 +43,7 @@ class PhaseConfig(BaseModel):
 class AdapterConfig(BaseModel):
     agent: dict[str, Any] | None = None
     job_overrides: dict[str, Any] = Field(default_factory=dict)
+    runner_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -50,6 +51,11 @@ class AdapterConfig(BaseModel):
         if self.agent is not None and not self.agent:
             raise ValueError("adapter.agent must not be empty")
         _validate_forbidden_job_keys(self.job_overrides, location="adapter.job_overrides")
+        for runner_adapter_id, runner_override in self.runner_overrides.items():
+            _validate_forbidden_runner_override_keys(
+                runner_override,
+                location=f"adapter.runner_overrides.{runner_adapter_id}",
+            )
         return self
 
 
@@ -472,7 +478,11 @@ def build_composed_job_config(
     ]
 
     payload = _deep_merge(payload, copy.deepcopy(runner_adapter.job_overrides))
-    return _deep_merge(payload, benchmark_job_overrides(benchmark_adapter))
+    payload = _deep_merge(payload, benchmark_job_overrides(benchmark_adapter))
+    runner_override = benchmark_adapter.runner_overrides.get(runner_adapter_id)
+    if runner_override:
+        payload = _deep_merge(payload, copy.deepcopy(runner_override))
+    return payload
 
 
 def resolve_runner_adapter_ids(
@@ -713,6 +723,17 @@ def print_manifest_summary(
 
 def _validate_forbidden_job_keys(payload: dict[str, Any], location: str) -> None:
     forbidden = sorted(key for key in payload if key in FORBIDDEN_JOB_KEYS)
+    if forbidden:
+        raise ValueError(
+            f"{location} may not set {', '.join(forbidden)}; those are generated automatically"
+        )
+
+
+def _validate_forbidden_runner_override_keys(
+    payload: dict[str, Any],
+    location: str,
+) -> None:
+    forbidden = sorted(key for key in payload if key in {"job_name", "datasets"})
     if forbidden:
         raise ValueError(
             f"{location} may not set {', '.join(forbidden)}; those are generated automatically"

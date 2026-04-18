@@ -1,0 +1,13 @@
+claude-code__claude-haiku-4.5:
+  agent:
+    name: claude-code
+    model_name: anthropic/claude-haiku-4-5-20251001
+    kwargs:
+      version: 2.1.81
+  metadata:
+    display_name: Claude Code / Claude Haiku 4.5
+    runner: claude-code
+    family: claude-code
+    model_name: anthropic/claude-haiku-4-5-20251001
+    generated_by: manual
+    provider: anthropic
