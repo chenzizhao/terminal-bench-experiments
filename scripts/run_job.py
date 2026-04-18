@@ -679,7 +679,7 @@ async def main():
         help="Filter error types",
     )
     parser.add_argument(
-        "--override-n-concurrent-trials",
+        "-n", "--override-n-concurrent-trials",
         type=int,
         help="Override n_concurrent_trials for this run, including resume runs.",
     )
