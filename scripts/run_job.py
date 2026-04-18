@@ -684,6 +684,13 @@ async def main():
         help="Override n_concurrent_trials for this run, including resume runs.",
     )
 
+    parser.add_argument(
+        "-n",
+        "--n_concurrent_trials",
+        type=int,
+        help="Number of concurrent trials to run (overrides config file)",
+    )
+
     args = parser.parse_args()
 
     config_path = args.config
@@ -692,6 +699,10 @@ async def main():
         config_dict = json.loads(config_text)
     else:
         config_dict = yaml.safe_load(config_text)
+
+    if args.n_concurrent_trials is not None:
+        config_dict["orchestrator"]["n_concurrent_trials"] = args.n_concurrent_trials
+        print(f"Overriding n_concurrent_trials to {args.n_concurrent_trials}")
 
     config = JobConfig.model_validate(config_dict)
     if args.override_n_concurrent_trials is not None:
